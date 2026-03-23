@@ -3,7 +3,9 @@ export type MessageType =
   | 'appointment-confirmation'
   | 'post-meeting'
   | 'recovery'
-  | 'clean-exit';
+  | 'clean-exit'
+  | 'install-welcome'
+  | 'purchase-thank-you';
 
 export interface Contact {
   id: string;
@@ -31,6 +33,34 @@ export interface SendRequest {
   messageType: MessageType;
   dryRun?: boolean;
   appointmentTime?: string; // ISO string for confirmation messages
+}
+
+/** DD API Gateway notify event — sent on install or purchase */
+export interface NotifyEvent {
+  type: 'install' | 'purchase';
+  email: string;
+  firstName?: string;
+  locationId: string;
+  contactId: string;
+  // purchase-specific fields
+  tier?: string;
+  apiKey?: string;
+}
+
+/** Inbound SMS reply routed from GHL */
+export interface InboundSmsEvent {
+  type?: string;
+  contactId?: string;
+  locationId?: string;
+  body?: string;
+  direction?: 'inbound' | 'outbound';
+  messageType?: string;
+  contact?: {
+    id: string;
+    firstName?: string;
+    lastName?: string;
+  };
+  [key: string]: unknown;
 }
 
 export interface GhlWebhookEvent {

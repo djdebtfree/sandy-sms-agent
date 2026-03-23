@@ -1,10 +1,17 @@
 import 'dotenv/config';
 import express from 'express';
 import { getContact, sendSms, lookupContactByPhone } from './ghl.js';
-import { generateMessage } from './ai.js';
+import { generateMessage, generateReply } from './ai.js';
 import { canSend } from './scheduler.js';
 import { logMessage, getHistory, getRecentMessages } from './db.js';
-import type { SendRequest, GhlWebhookEvent, VapiWebhookEvent, MessageType } from './types.js';
+import type {
+  SendRequest,
+  GhlWebhookEvent,
+  VapiWebhookEvent,
+  NotifyEvent,
+  InboundSmsEvent,
+  MessageType,
+} from './types.js';
 
 const app = express();
 app.use(express.json());
@@ -18,6 +25,88 @@ app.get('/health', (_req, res) => {
     service: 'sandy-sms-agent',
     timestamp: new Date().toISOString(),
   });
+});
+
+// ── DD API Gateway Notify ─────────────────────────────────
+// Receives install and purchase events from the DD API Gateway
+app.post('/api/notify', async (req, res) => {
+  try {
+    const event = req.body as NotifyEvent;
+    console.log('Notify event received:', JSON.stringify(event).slice(0, 500));
+
+    // Validate required fields
+    if (!event.type || !event.contactId) {
+      return res.status(400).json({
+        error: 'Missing required fields: type and contactId are required',
+      });
+    }
+
+    if (event.type !== 'install' && event.type !== 'purchase') {
+      return res.status(400).json({
+        error: `Invalid event type: ${event.type}. Must be "install" or "purchase".`,
+      });
+    }
+
+    // Map event type to message type
+    const messageType: MessageType =
+      event.type === 'install' ? 'install-welcome' : 'purchase-thank-you';
+
+    // Check sending rules (rate limit, quiet hours, clean exit)
+    const check = await canSend(event.contactId);
+    if (!check.allowed) {
+      console.log(`Notify blocked for ${event.contactId}: ${check.reason}`);
+      await logMessage({
+        contact_id: event.contactId,
+        contact_name: event.firstName ?? null,
+        message_type: messageType,
+        message_content: `[BLOCKED] ${check.reason}`,
+        ghl_message_id: null,
+        status: 'blocked',
+      });
+      return res.status(200).json({
+        received: true,
+        action: 'blocked',
+        reason: check.reason,
+      });
+    }
+
+    // Get full contact from GHL
+    const contact = await getContact(event.contactId);
+    const contactName =
+      [contact.firstName, contact.lastName].filter(Boolean).join(' ') || event.firstName || null;
+
+    // Generate personalized follow-up message
+    const messageContent = await generateMessage(messageType, contact, {
+      tier: event.tier,
+    });
+
+    // Send via GHL Conversations API
+    const ghlMessageId = await sendSms(event.contactId, messageContent);
+
+    // Log to Supabase
+    const logged = await logMessage({
+      contact_id: event.contactId,
+      contact_name: contactName,
+      message_type: messageType,
+      message_content: messageContent,
+      ghl_message_id: ghlMessageId,
+      status: 'sent',
+    });
+
+    console.log(`Notify ${event.type} -> ${messageType} sent to ${event.contactId}`);
+
+    res.json({
+      received: true,
+      action: 'sent',
+      messageType,
+      contactId: event.contactId,
+      messageId: ghlMessageId,
+      logged: logged.id,
+    });
+  } catch (err: any) {
+    console.error('Notify error:', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ── Status ────────────────────────────────────────────────
@@ -60,6 +149,8 @@ app.post('/send', async (req, res) => {
       'post-meeting',
       'recovery',
       'clean-exit',
+      'install-welcome',
+      'purchase-thank-you',
     ];
     if (!validTypes.includes(messageType)) {
       return res.status(400).json({ error: `Invalid messageType. Valid: ${validTypes.join(', ')}` });
@@ -175,6 +266,57 @@ app.post('/webhook/ghl', async (req, res) => {
     res.json({ received: true, action: 'sent', messageType, contactId });
   } catch (err: any) {
     console.error('GHL webhook error:', err);
+    res.status(200).json({ received: true, action: 'error', error: err.message });
+  }
+});
+
+// ── Inbound SMS Reply Handler ─────────────────────────────
+// GHL sends inbound SMS events here; Sandy generates a contextual reply
+app.post('/webhook/inbound', async (req, res) => {
+  try {
+    const event = req.body as InboundSmsEvent;
+    console.log('Inbound SMS received:', JSON.stringify(event).slice(0, 500));
+
+    // Only process inbound messages
+    if (event.direction && event.direction !== 'inbound') {
+      return res.status(200).json({ received: true, action: 'ignored', reason: 'not inbound' });
+    }
+
+    const contactId = event.contactId ?? event.contact?.id;
+    if (!contactId || !event.body) {
+      return res.status(200).json({ received: true, action: 'no_contact_or_body' });
+    }
+
+    // Check sending rules
+    const check = await canSend(contactId);
+    if (!check.allowed) {
+      console.log(`Inbound reply blocked for ${contactId}: ${check.reason}`);
+      return res.status(200).json({ received: true, action: 'blocked', reason: check.reason });
+    }
+
+    // Get contact details and conversation history
+    const contact = await getContact(contactId);
+    const contactName =
+      [contact.firstName, contact.lastName].filter(Boolean).join(' ') || null;
+    const history = await getHistory(contactId);
+
+    // Generate contextual reply using AI
+    const replyContent = await generateReply(contact, event.body, history);
+    const ghlMessageId = await sendSms(contactId, replyContent);
+
+    await logMessage({
+      contact_id: contactId,
+      contact_name: contactName,
+      message_type: 'prospect-followup',
+      message_content: replyContent,
+      ghl_message_id: ghlMessageId,
+      status: 'sent',
+    });
+
+    console.log(`Inbound reply sent to ${contactId}`);
+    res.json({ received: true, action: 'replied', contactId });
+  } catch (err: any) {
+    console.error('Inbound SMS error:', err);
     res.status(200).json({ received: true, action: 'error', error: err.message });
   }
 });
