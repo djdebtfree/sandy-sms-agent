@@ -1,7 +1,13 @@
 import type { Contact } from './types.js';
 
 const API_BASE = process.env.GHL_API_BASE || 'https://services.leadconnectorhq.com';
-const API_KEY = process.env.GHL_API_KEY!;
+// GHL_PIT_TOKEN is the primary auth token (Private Integration Token for DD Installs sub-account)
+// Falls back to GHL_API_KEY for backward compatibility
+const API_KEY = process.env.GHL_PIT_TOKEN || process.env.GHL_API_KEY;
+if (!API_KEY) {
+  console.error('FATAL: GHL_PIT_TOKEN (or GHL_API_KEY) must be set');
+  process.exit(1);
+}
 const API_VERSION = process.env.GHL_API_VERSION || '2021-07-28';
 
 const headers = {
