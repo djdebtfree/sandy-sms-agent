@@ -376,7 +376,11 @@ app.post('/webhook/vapi', async (req, res) => {
 });
 
 // ── Start ─────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`Sandy Beach SMS Agent running on port ${PORT}`);
-  console.log(`Health: http://localhost:${PORT}/health`);
-});
+if (!process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`Sandy Beach SMS Agent running on port ${PORT}`);
+    console.log(`Health: http://localhost:${PORT}/health`);
+  });
+}
+
+export default app;
