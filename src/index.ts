@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
-import { getContact, sendSms, lookupContactByPhone } from './ghl.js';
-import { generateMessage, generateReply } from './ai.js';
+import { getContact, sendSms, lookupContactByPhone, updateGhlContact } from './ghl.js';
+import { processSandyMessage } from './ai.js';
 import { canSend } from './scheduler.js';
 import { logMessage, getHistory, getRecentMessages } from './db.js';
 import type {
@@ -51,58 +51,79 @@ app.post('/api/notify', async (req, res) => {
     const messageType: MessageType =
       event.type === 'install' ? 'install-welcome' : 'purchase-thank-you';
 
-    // Check sending rules (rate limit, quiet hours, clean exit)
-    const check = await canSend(event.contactId);
-    if (!check.allowed) {
-      console.log(`Notify blocked for ${event.contactId}: ${check.reason}`);
+    // Get full contact from GHL
+    const contact = await getContact(event.contactId);
+    const contactName =
+      [contact.firstName, contact.lastName].filter(Boolean).join(' ') || event.firstName || null;
+
+    // Process message through Sandy Brain
+    const brainOutput = await processSandyMessage(messageType, contact, {
+      tier: event.tier,
+    });
+
+    if (brainOutput.suppressed) {
+      console.log(`Notify blocked by Sandy Brain for ${event.contactId}: ${brainOutput.logReason}`);
       await logMessage({
         contact_id: event.contactId,
-        contact_name: event.firstName ?? null,
+        contact_name: contactName ?? null,
         message_type: messageType,
-        message_content: `[BLOCKED] ${check.reason}`,
+        message_content: `[BLOCKED by Brain] ${brainOutput.logReason}`,
         ghl_message_id: null,
         status: 'blocked',
       });
       return res.status(200).json({
         received: true,
         action: 'blocked',
-        reason: check.reason,
+        reason: brainOutput.logReason,
       });
     }
 
-    // Get full contact from GHL
-    const contact = await getContact(event.contactId);
-    const contactName =
-      [contact.firstName, contact.lastName].filter(Boolean).join(' ') || event.firstName || null;
+    if (brainOutput.action === 'send_message' && brainOutput.response) {
+      // Send via GHL Conversations API
+      const ghlMessageId = await sendSms(event.contactId, brainOutput.response);
 
-    // Generate personalized follow-up message
-    const messageContent = await generateMessage(messageType, contact, {
-      tier: event.tier,
-    });
+      // Log to Supabase
+      const logged = await logMessage({
+        contact_id: event.contactId,
+        contact_name: contactName ?? null,
+        message_type: messageType,
+        message_content: brainOutput.response,
+        ghl_message_id: ghlMessageId,
+        status: 'sent',
+      });
 
-    // Send via GHL Conversations API
-    const ghlMessageId = await sendSms(event.contactId, messageContent);
+      // Update GHL contact if brain suggests it
+      if (brainOutput.contactUpdate) {
+        await updateGhlContact(event.contactId, brainOutput.contactUpdate);
+      }
 
-    // Log to Supabase
-    const logged = await logMessage({
-      contact_id: event.contactId,
-      contact_name: contactName,
-      message_type: messageType,
-      message_content: messageContent,
-      ghl_message_id: ghlMessageId,
-      status: 'sent',
-    });
+      console.log(`Notify ${event.type} -> ${messageType} sent to ${event.contactId}`);
 
-    console.log(`Notify ${event.type} -> ${messageType} sent to ${event.contactId}`);
+      return res.json({
+        received: true,
+        action: 'sent',
+        messageType,
+        contactId: event.contactId,
+        messageId: ghlMessageId,
+        logged: logged.id,
+      });
+    } else {
+      console.log(`Notify event processed by Sandy Brain, but no message sent for ${event.contactId}. Action: ${brainOutput.action}`);
+      await logMessage({
+        contact_id: event.contactId,
+        contact_name: contactName ?? null,
+        message_type: messageType,
+        message_content: `[NO MESSAGE] Brain action: ${brainOutput.action}`,
+        ghl_message_id: null,
+        status: 'blocked',
+      });
+      return res.status(200).json({
+        received: true,
+        action: 'no_message_sent',
+        reason: `Brain action: ${brainOutput.action}`,
+      });
+    }
 
-    res.json({
-      received: true,
-      action: 'sent',
-      messageType,
-      contactId: event.contactId,
-      messageId: ghlMessageId,
-      logged: logged.id,
-    });
   } catch (err: any) {
     console.error('Notify error:', err);
     res.status(500).json({ error: err.message });
@@ -186,28 +207,58 @@ app.post('/send', async (req, res) => {
     const contact = await getContact(contactId);
     const contactName = [contact.firstName, contact.lastName].filter(Boolean).join(' ') || null;
 
-    // Generate personalized message
-    const messageContent = await generateMessage(messageType, contact, { appointmentTime });
+    // Process message through Sandy Brain
+    const brainOutput = await processSandyMessage(messageType, contact, { appointmentTime });
 
-    // Send via GHL Conversations API
-    const ghlMessageId = await sendSms(contactId, messageContent);
+    if (brainOutput.suppressed) {
+      await logMessage({
+        contact_id: contactId,
+        contact_name: contactName ?? null,
+        message_type: messageType,
+        message_content: `[BLOCKED by Brain] ${brainOutput.logReason}`,
+        ghl_message_id: null,
+        status: 'blocked',
+      });
+      return res.status(429).json({ error: brainOutput.logReason, blocked: true });
+    }
 
-    // Log to Supabase
-    const logged = await logMessage({
-      contact_id: contactId,
-      contact_name: contactName,
-      message_type: messageType,
-      message_content: messageContent,
-      ghl_message_id: ghlMessageId,
-      status: 'sent',
-    });
+    if (brainOutput.action === 'send_message' && brainOutput.response) {
+      const ghlMessageId = await sendSms(contactId, brainOutput.response);
 
-    res.json({
-      success: true,
-      messageId: ghlMessageId,
-      content: messageContent,
-      logged: logged.id,
-    });
+      await logMessage({
+        contact_id: contactId,
+        contact_name: contactName ?? null,
+        message_type: messageType,
+        message_content: brainOutput.response,
+        ghl_message_id: ghlMessageId,
+        status: 'sent',
+      });
+
+      if (brainOutput.contactUpdate) {
+        await updateGhlContact(contactId, brainOutput.contactUpdate);
+      }
+
+      return res.json({
+        success: true,
+        messageId: ghlMessageId,
+        content: brainOutput.response,
+        logged: brainOutput.response,
+      });
+    } else {
+      await logMessage({
+        contact_id: contactId,
+        contact_name: contactName ?? null,
+        message_type: messageType,
+        message_content: `[NO MESSAGE] Brain action: ${brainOutput.action}`,
+        ghl_message_id: null,
+        status: 'blocked',
+      });
+      return res.status(200).json({
+        success: false,
+        message: `Brain action: ${brainOutput.action}`,
+      });
+    }
+
   } catch (err: any) {
     console.error('Send error:', err);
     res.status(500).json({ error: err.message });
@@ -241,29 +292,48 @@ app.post('/webhook/ghl', async (req, res) => {
       return res.status(200).json({ received: true, action: 'no_matching_stage', stage: stageName });
     }
 
-    // Check sending rules
-    const check = await canSend(contactId);
-    if (!check.allowed) {
-      console.log(`Webhook blocked for ${contactId}: ${check.reason}`);
-      return res.status(200).json({ received: true, action: 'blocked', reason: check.reason });
-    }
-
-    // Generate and send
+    // Get contact from GHL
     const contact = await getContact(contactId);
     const contactName = [contact.firstName, contact.lastName].filter(Boolean).join(' ') || null;
-    const messageContent = await generateMessage(messageType, contact);
-    const ghlMessageId = await sendSms(contactId, messageContent);
 
-    await logMessage({
-      contact_id: contactId,
-      contact_name: contactName,
-      message_type: messageType,
-      message_content: messageContent,
-      ghl_message_id: ghlMessageId,
-      status: 'sent',
-    });
+    // Process message through Sandy Brain
+    const brainOutput = await processSandyMessage(messageType, contact);
 
-    res.json({ received: true, action: 'sent', messageType, contactId });
+    if (brainOutput.suppressed) {
+      console.log(`Webhook blocked for ${contactId}: ${brainOutput.logReason}`);
+      return res.status(200).json({ received: true, action: 'blocked', reason: brainOutput.logReason });
+    }
+
+    if (brainOutput.action === 'send_message' && brainOutput.response) {
+      const ghlMessageId = await sendSms(contactId, brainOutput.response);
+
+      await logMessage({
+        contact_id: contactId,
+        contact_name: contactName ?? null,
+        message_type: messageType,
+        message_content: brainOutput.response,
+        ghl_message_id: ghlMessageId,
+        status: 'sent',
+      });
+
+      if (brainOutput.contactUpdate) {
+        await updateGhlContact(contactId, brainOutput.contactUpdate);
+      }
+
+      res.json({ received: true, action: 'sent', messageType, contactId });
+    } else {
+      console.log(`Webhook processed by Sandy Brain, but no message sent for ${contactId}. Action: ${brainOutput.action}`);
+      await logMessage({
+        contact_id: contactId,
+        contact_name: contactName ?? null,
+        message_type: messageType,
+        message_content: `[NO MESSAGE] Brain action: ${brainOutput.action}`,
+        ghl_message_id: null,
+        status: 'blocked',
+      });
+      res.status(200).json({ received: true, action: 'no_message_sent', reason: `Brain action: ${brainOutput.action}` });
+    }
+
   } catch (err: any) {
     console.error('GHL webhook error:', err);
     res.status(200).json({ received: true, action: 'error', error: err.message });
@@ -287,34 +357,50 @@ app.post('/webhook/inbound', async (req, res) => {
       return res.status(200).json({ received: true, action: 'no_contact_or_body' });
     }
 
-    // Check sending rules
-    const check = await canSend(contactId);
-    if (!check.allowed) {
-      console.log(`Inbound reply blocked for ${contactId}: ${check.reason}`);
-      return res.status(200).json({ received: true, action: 'blocked', reason: check.reason });
-    }
-
     // Get contact details and conversation history
     const contact = await getContact(contactId);
     const contactName =
       [contact.firstName, contact.lastName].filter(Boolean).join(' ') || null;
-    const history = await getHistory(contactId);
 
-    // Generate contextual reply using AI
-    const replyContent = await generateReply(contact, event.body, history);
-    const ghlMessageId = await sendSms(contactId, replyContent);
+    // Process message through Sandy Brain
+    const brainOutput = await processSandyMessage('inbound-reply', contact, { inboundMessage: event.body });
 
-    await logMessage({
-      contact_id: contactId,
-      contact_name: contactName,
-      message_type: 'prospect-followup',
-      message_content: replyContent,
-      ghl_message_id: ghlMessageId,
-      status: 'sent',
-    });
+    if (brainOutput.suppressed) {
+      console.log(`Inbound reply blocked for ${contactId}: ${brainOutput.logReason}`);
+      return res.status(200).json({ received: true, action: 'blocked', reason: brainOutput.logReason });
+    }
 
-    console.log(`Inbound reply sent to ${contactId}`);
-    res.json({ received: true, action: 'replied', contactId });
+    if (brainOutput.action === 'send_message' && brainOutput.response) {
+      const ghlMessageId = await sendSms(contactId, brainOutput.response);
+
+      await logMessage({
+        contact_id: contactId,
+        contact_name: contactName ?? null,
+        message_type: 'inbound-reply',
+        message_content: brainOutput.response,
+        ghl_message_id: ghlMessageId,
+        status: 'sent',
+      });
+
+      if (brainOutput.contactUpdate) {
+        await updateGhlContact(contactId, brainOutput.contactUpdate);
+      }
+
+      console.log(`Inbound reply sent to ${contactId}`);
+      res.json({ received: true, action: 'replied', contactId });
+    } else {
+      console.log(`Inbound reply processed by Sandy Brain, but no message sent for ${contactId}. Action: ${brainOutput.action}`);
+      await logMessage({
+        contact_id: contactId,
+        contact_name: contactName ?? null,
+        message_type: 'inbound-reply',
+        message_content: `[NO MESSAGE] Brain action: ${brainOutput.action}`,
+        ghl_message_id: null,
+        status: 'blocked',
+      });
+      res.status(200).json({ received: true, action: 'no_message_sent', reason: `Brain action: ${brainOutput.action}` });
+    }
+
   } catch (err: any) {
     console.error('Inbound SMS error:', err);
     res.status(200).json({ received: true, action: 'error', error: err.message });
@@ -347,28 +433,48 @@ app.post('/webhook/vapi', async (req, res) => {
       return res.status(200).json({ received: true, action: 'no_contact_found' });
     }
 
-    // Check sending rules
-    const check = await canSend(contactId);
-    if (!check.allowed) {
-      return res.status(200).json({ received: true, action: 'blocked', reason: check.reason });
-    }
-
-    // Send post-meeting follow-up (after voice call completes)
+    // Get contact from GHL
     const contact = await getContact(contactId);
     const contactName = [contact.firstName, contact.lastName].filter(Boolean).join(' ') || null;
-    const messageContent = await generateMessage('post-meeting', contact);
-    const ghlMessageId = await sendSms(contactId, messageContent);
 
-    await logMessage({
-      contact_id: contactId,
-      contact_name: contactName,
-      message_type: 'post-meeting',
-      message_content: messageContent,
-      ghl_message_id: ghlMessageId,
-      status: 'sent',
-    });
+    // Process message through Sandy Brain
+    const brainOutput = await processSandyMessage('post-meeting', contact);
 
-    res.json({ received: true, action: 'sent', messageType: 'post-meeting', contactId });
+    if (brainOutput.suppressed) {
+      console.log(`VAPI webhook blocked for ${contactId}: ${brainOutput.logReason}`);
+      return res.status(200).json({ received: true, action: 'blocked', reason: brainOutput.logReason });
+    }
+
+    if (brainOutput.action === 'send_message' && brainOutput.response) {
+      const ghlMessageId = await sendSms(contactId, brainOutput.response);
+
+      await logMessage({
+        contact_id: contactId,
+        contact_name: contactName ?? null,
+        message_type: 'post-meeting',
+        message_content: brainOutput.response,
+        ghl_message_id: ghlMessageId,
+        status: 'sent',
+      });
+
+      if (brainOutput.contactUpdate) {
+        await updateGhlContact(contactId, brainOutput.contactUpdate);
+      }
+
+      res.json({ received: true, action: 'sent', messageType: 'post-meeting', contactId });
+    } else {
+      console.log(`VAPI webhook processed by Sandy Brain, but no message sent for ${contactId}. Action: ${brainOutput.action}`);
+      await logMessage({
+        contact_id: contactId,
+        contact_name: contactName ?? null,
+        message_type: 'post-meeting',
+        message_content: `[NO MESSAGE] Brain action: ${brainOutput.action}`,
+        ghl_message_id: null,
+        status: 'blocked',
+      });
+      res.status(200).json({ received: true, action: 'no_message_sent', reason: `Brain action: ${brainOutput.action}` });
+    }
+
   } catch (err: any) {
     console.error('VAPI webhook error:', err);
     res.status(200).json({ received: true, action: 'error', error: err.message });

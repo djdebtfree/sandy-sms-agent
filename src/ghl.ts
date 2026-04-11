@@ -1,4 +1,4 @@
-import type { Contact } from './types.js';
+import type { GhlContact } from './types.js';
 
 const API_BASE = process.env.GHL_API_BASE || 'https://services.leadconnectorhq.com';
 // GHL_PIT_TOKEN is the primary auth token (Private Integration Token for DD Installs sub-account)
@@ -16,7 +16,7 @@ const headers = {
   'Content-Type': 'application/json',
 };
 
-export async function getContact(contactId: string): Promise<Contact> {
+export async function getContact(contactId: string): Promise<GhlContact> {
   const res = await fetch(`${API_BASE}/contacts/${contactId}`, { headers });
   if (!res.ok) {
     const text = await res.text();
@@ -24,6 +24,22 @@ export async function getContact(contactId: string): Promise<Contact> {
   }
   const data = await res.json();
   return data.contact ?? data;
+}
+
+export async function updateGhlContact(contactId: string, payload: Partial<GhlContact>): Promise<GhlContact | null> {
+  const res = await fetch(`${API_BASE}/contacts/${contactId}`, {
+    method: 'PUT',
+    headers,
+    body: JSON.stringify(payload),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    console.error(`GHL updateGhlContact failed (${res.status}):`, text);
+    throw new Error(`GHL contact update failed with ${res.status}`);
+  }
+
+  return res.json();
 }
 
 export async function sendSms(contactId: string, message: string): Promise<string | null> {
@@ -46,7 +62,7 @@ export async function sendSms(contactId: string, message: string): Promise<strin
   return data.messageId ?? data.id ?? null;
 }
 
-export async function lookupContactByPhone(phone: string): Promise<Contact | null> {
+export async function lookupContactByPhone(phone: string): Promise<GhlContact | null> {
   const locationId = process.env.GHL_LOCATION_ID;
   const res = await fetch(
     `${API_BASE}/contacts/?locationId=${locationId}&query=${encodeURIComponent(phone)}&limit=1`,
